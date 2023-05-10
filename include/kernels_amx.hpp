@@ -156,7 +156,7 @@ namespace functional {
     }
 
     // 16xN, N<=16, non-valid part is filled with zeros
-    void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_bytes) {
+    inline void transpose_epi32_16xN(void * _dst, const void * src, int stride, int valid_bytes) {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         auto * pA = reinterpret_cast<const uint8_t*>(src);
@@ -198,7 +198,7 @@ namespace functional {
     }
 
     // 16xN, N<=16, non-valid part is on the left, filled with zeros
-    void transpose_epi32_16xN_right_align(void * _dst, const void * src, int stride, int valid_bytes) {
+    inline void transpose_epi32_16xN_right_align(void * _dst, const void * src, int stride, int valid_bytes) {
         auto * dst = reinterpret_cast<uint32_t*>(_dst);
         __m512i r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, ra, rb, rc, rd, re, rf;
         int invalid_bytes = 64 - valid_bytes;
@@ -293,7 +293,7 @@ namespace functional {
 
 
     //
-    void kpack_tile_B0B1(void * _dst0, void * _dst1, const int8_t * _src, int stride, int src_rows) {
+    inline void kpack_tile_B0B1(void * _dst0, void * _dst1, const int8_t * _src, int stride, int src_rows) {
         #define FROM_B(i) ((1<<4)|(i))
         static const uint32_t idx[16] = { 0,4,FROM_B(0),FROM_B(4),
                                           1,5,FROM_B(1),FROM_B(5),
@@ -393,7 +393,7 @@ namespace functional {
         }
     }
 
-    void kpack_tile_B0B1(void * _dst0, void * _dst1, const ov::bfloat16 * _src, int stride, int src_rows) {
+    inline void kpack_tile_B0B1(void * _dst0, void * _dst1, const ov::bfloat16 * _src, int stride, int src_rows) {
         static const uint64_t idx[8] = {0,4,1,5,2,6,3,7};
         auto midx = _mm512_loadu_epi64(idx);
         const auto * src = reinterpret_cast<const int8_t *>(_src);
@@ -508,7 +508,7 @@ namespace functional {
         }
     }
 
-    void bf16_to_i8_tensor(tensor2D<int8_t>& dst, tensor2D<ov::bfloat16>& src, float quant_scale) {
+    inline void bf16_to_i8_tensor(tensor2D<int8_t>& dst, tensor2D<ov::bfloat16>& src, float quant_scale) {
         dst.resize(src.dims[0], src.dims[1]);
         auto scale = _mm512_set1_ps(quant_scale);
         for (int k = 0; k < src.dims[0]; k++) {
@@ -549,7 +549,13 @@ namespace PP {
 
         BIAS_GELU = BIAS | GELU,
         DEQUANT_BIAS_GELU = DEQUANT | BIAS_GELU,
-        DEQUANT_BIAS_GELU_QUANT = DEQUANT_BIAS_GELU | QUANT
+        DEQUANT_BIAS_GELU_QUANT = DEQUANT_BIAS_GELU | QUANT,
+        DEQUANT_BIAS_QUANT = DEQUANT | BIAS | QUANT,
+        DEQUANT_GELU_QUANT = DEQUANT | GELU | QUANT,
+        DEQUANT_QUANT = DEQUANT | QUANT,
+        
+        DEQUANT_GELU = DEQUANT | GELU,
+        DEQUANT_BIAS = DEQUANT | BIAS
     };
 
     template<typename D, Steps steps>
@@ -566,10 +572,17 @@ namespace PP {
             bias = _bias;
         }
 
-        float deq_scale = 1.0f;
+        float deq_scale_common = 1.0f;
+        float * deq_scale_per_oc = nullptr;
         void set_deq_scale(float scale = 1.0f) {
             assert (steps & DEQUANT);
-            deq_scale = scale;
+            deq_scale_common = scale;
+            deq_scale_per_oc = nullptr;
+        }
+        void set_deq_scale(float * scale_per_oc) {
+            assert (steps & DEQUANT);
+            deq_scale_common = 0;
+            deq_scale_per_oc = scale_per_oc;
         }
 
         float q_scale_common = 0.0f;
@@ -600,9 +613,16 @@ namespace PP {
 
             __m512  m512_q_scale0;
             __m512  m512_q_scale1;
-            __m512  m512_deq_scale;
+            __m512  m512_deq_scale0;
+            __m512  m512_deq_scale1;
             if (steps & DEQUANT) {
-                m512_deq_scale = _mm512_set1_ps(deq_scale);
+                if (deq_scale_per_oc) {
+                    m512_deq_scale0 = _mm512_loadu_ps(deq_scale_per_oc + n);
+                    m512_deq_scale1 = _mm512_loadu_ps(deq_scale_per_oc + n + 16);
+                } else {
+                    m512_deq_scale0 = _mm512_set1_ps(deq_scale_common);
+                    m512_deq_scale1 = _mm512_set1_ps(deq_scale_common);
+                }
             }
             if (steps & QUANT) {
                 if (q_scale_per_oc) {
@@ -636,8 +656,8 @@ namespace PP {
                     r1 = _mm512_cvtepi32_ps(_mm512_castps_si512(r1));   // cvt i32=>f32
                 }
                 if (steps & DEQUANT) {
-                    r0 = _mm512_mul_ps(r0, m512_deq_scale);   // dequantize
-                    r1 = _mm512_mul_ps(r1, m512_deq_scale);   // dequantize
+                    r0 = _mm512_mul_ps(r0, m512_deq_scale0);   // dequantize
+                    r1 = _mm512_mul_ps(r1, m512_deq_scale1);   // dequantize
                 }
                 if (steps & BIAS) {
                     r0 = _mm512_add_ps(r0, bias0);
@@ -679,6 +699,7 @@ namespace PP {
 template <int bytes, int sel=_MM_HINT_T0, int advance = 4096>
 void prefetch_bytes(void *src)
 {
+    return;
     int8_t *p = reinterpret_cast<int8_t *>(src);
     for (int i = 0; i < bytes; i+=64)
         _mm_prefetch(p + i + advance, sel);
@@ -1361,11 +1382,11 @@ struct Matmul<ov::bfloat16, int8_t, float> {
             if (!constB) {
                 std::cout << "\t WANING: dynamic quantization of weight matrix for non-constB is time-consuming " << std::endl;
             }
-            float min, max;
-            functional::get_min_max(_matB, min, max);
-            max = std::max(std::abs(max), std::abs(min));
-            quant_scale_B = 127 / max;
-            dequant_scale_B = max / 127;
+            // float min, max;
+            // functional::get_min_max(_matB, min, max);
+            // max = std::max(std::abs(max), std::abs(min));
+            // quant_scale_B = 127 / max;
+            // dequant_scale_B = max / 127;
 
             auto internalTmpB = repackB_1x2(matB, transposeB);
             functional::bf16_to_i8_tensor(internalBI8, internalTmpB, quant_scale_B);
@@ -1614,7 +1635,7 @@ struct GemAvB {
 
 } // namespace amx
 
-std::ostream & operator<<(std::ostream & os, const amx_kernel::PP::Steps & steps) {
+inline std::ostream & operator<<(std::ostream & os, const amx_kernel::PP::Steps & steps) {
     os << "amx_kernel::PP::Steps::";
     if (steps == amx_kernel::PP::Steps::NONE)
         os << "NONE";
