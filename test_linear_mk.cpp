@@ -328,8 +328,8 @@ timeit timer({
     {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
     //{PERF_TYPE_RAW, 0x3c, "CPU_CLK_UNHALTED.THREAD"},
     //{PERF_TYPE_RAW, 0x81d0, "MEM_LOAD_RETIRED.ALL_LOADS"},
-    //{PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
-    //{PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
+    {PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
+    {PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
     //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
 });
 
@@ -342,13 +342,17 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
     auto Bt = B.Tr();
     tensor2D<ov::bfloat16> BPacked(K * N, 1, true);
     tensor2D<float> C0(M, N, true); // reference result
-    tensor2D<float> C1(M, N, true); // actual result
+    tensor2D<float> C1_(M, N + 16, true); // actual result
+    //tensor2D<float> C1(M, N, true); // actual result
+    tensor2D<float> C1(M, N, &C1_[0], C1_.stride); // actual result
     LinearAMX mm_jit(K);
     TileConfigScope tcfg(mm_jit.tile_config());
 
-    for (int k = 0, i = 0; k < K; k += 32) {
-        for (int n = 0; n < N; n += 16) {
-            amx_kernel::functional::transpose_epi32_16x16(&BPacked[i * 16 * 32], &Bt(n, k), Bt.stride);
+    int i = 0;
+    for (int n0 = 0; n0 < N; n0 += 32)
+    for (int k = 0; k < K; k += 32) {
+        for (int n = 0; n < 32; n += 16) {
+            amx_kernel::functional::transpose_epi32_16x16(&BPacked[i * 16 * 32], &Bt(n0 + n, k), Bt.stride);
             i++;
         }
     }
@@ -358,7 +362,9 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
 
     std::string acc;
     std::string acc_color;
-    mm_jit(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride);
+    for (int n = 0; n < N; n += 32) {
+        mm_jit(&A[0], A.stride, &BPacked[n / 32 * 1024 * K / 32], &C1(0, n), C1.stride);
+    }
 
     if (C0 == C1) {
         acc = "[PASS]";
@@ -377,7 +383,12 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
 
     timer.tag(__func__, "(M=", M, ",N=", N, ",K=", K, ")", acc)
         .color(acc_color)(
-            times, [&]() { mm_jit(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride); },
+            times, [&]() { 
+                //mm_jit(&A[0], A.stride, &BPacked[0], &C1[0], C1.stride); 
+                for (int n = 0; n < N; n += 32) {
+                    mm_jit(&A[0], A.stride, &BPacked[n / 32 * 1024 * K / 32], &C1(0, n), C1.stride);
+                }
+            },
             M * N * K * 2 // OPS per call
         );
 
@@ -495,34 +506,34 @@ int main(int argc, const char* argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
-    std::cout << "===============================Strided load is slightly slower========================\n";
-    profile_tileload();
-    profile_tileload();
-    profile_tileload();
-    std::cout << "===============================BF16========================\n";
-    amx_mm(32, 32, 128);
-    amx_jit<Linear32x32_AMX>(32, 32, 128);
-    amx_mm(32, 32, 128);
-    amx_jit<Linear32x32_AMX>(32, 32, 128);
+    // std::cout << "===============================Strided load is slightly slower========================\n";
+    // profile_tileload();
+    // profile_tileload();
+    // profile_tileload();
+    // std::cout << "===============================BF16========================\n";
+    // amx_mm(32, 32, 128);
+    // amx_jit<Linear32x32_AMX>(32, 32, 128);
+    // amx_mm(32, 32, 128);
+    // amx_jit<Linear32x32_AMX>(32, 32, 128);
 
     std::cout << "===============================32x32 (L2)========================\n";
     for (int i = 0; i < 2; i++) {
-        amx_mm(32, 32, 4096);
-        amx_jit<Linear32x32_AMX>(32, 32, 4096);
+        amx_mm(32, 1024, 64);
+        amx_jit<Linear32x32_AMX>(32, 1024, 64);
     }
-    std::cout << "===============================32x32 (LLC)========================\n";
-    for (int i = 0; i < 2; i++) {
-        amx_mm(32, 32, 4096 * 16);
-        amx_jit<Linear32x32_AMX>(32, 32, 4096 * 16);
-    }
-    std::cout << "===============================16x96========================\n";
-    for (int i = 0; i < 2; i++) {
-        amx_mm(16, 96, 4096);
-        amx_jit<Linear16x96_AMX>(16, 96, 4096);
-    }
-    std::cout << "===============================16x64========================\n";
-    for (int i = 0; i < 2; i++) {
-        amx_mm(16, 64, 4096);
-        amx_jit<Linear16x64_AMX>(16, 64, 4096);
-    }
+    // std::cout << "===============================32x32 (LLC)========================\n";
+    // for (int i = 0; i < 2; i++) {
+    //     amx_mm(32, 32, 4096 * 16);
+    //     amx_jit<Linear32x32_AMX>(32, 32, 4096 * 16);
+    // }
+    // std::cout << "===============================16x96========================\n";
+    // for (int i = 0; i < 2; i++) {
+    //     amx_mm(16, 96, 4096);
+    //     amx_jit<Linear16x96_AMX>(16, 96, 4096);
+    // }
+    // std::cout << "===============================16x64========================\n";
+    // for (int i = 0; i < 2; i++) {
+    //     amx_mm(16, 64, 4096);
+    //     amx_jit<Linear16x64_AMX>(16, 64, 4096);
+    // }
 }
