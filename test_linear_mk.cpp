@@ -354,8 +354,8 @@ int amx_jit(const int M, const int N, const int K, int times = -1000) {
     tensor2D<ov::bfloat16> BPacked(K * N, 1, true);
     tensor2D<float> C0(M, N, true); // reference result
     tensor2D<float> C1_(M, N + 16, true); // actual result
-    //tensor2D<float> C1(M, N, true); // actual result
     tensor2D<float> C1(M, N, &C1_[0], C1_.stride); // actual result
+    //tensor2D<float> C1(M, N, true); // actual result
     LinearAMX mm_jit(K);
     TileConfigScope tcfg(mm_jit.tile_config());
 

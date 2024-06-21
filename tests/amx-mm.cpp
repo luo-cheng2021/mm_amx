@@ -39,7 +39,7 @@ static tensor2D<ov::bfloat16> repack_weights(tensor2D<ov::bfloat16>& Bt) {
 }
 
 EnvVar SWPFA("SWPFA", 0); // prefetch A is slower, so disable it
-EnvVar MHINT("MHINT", 256);
+EnvVar MHINT("MHINT", 0);
 
 class Linear32x32_AMX_mkernel : public jit_generator {
 public:
@@ -202,7 +202,7 @@ public:
         A : 2x1 tiles  C: 2x2 tiles
         */
         Xbyak::Label loop_over_ktiles;
-
+        
         if (m_do_accumulation) {
             auto reg_C1_addr = reg_A1_addr; // reuse reg_A1_addr
 #if 0
@@ -241,7 +241,7 @@ public:
 
         auto const_A_steps = 64;
 
-        align(64, false);
+        align(64);
         L(loop_over_ktiles);
         // for (int k = 0; k < Ktiles; k++) {
         tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride]);
@@ -794,10 +794,165 @@ EnvVar BN("BN", 256);
 EnvVar BK("BK", 256);
 EnvVar NK("NK", 16);
 
+void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
+    // tensor2D<ov::bfloat16> A(BM, BK, true);
+    tensor2D<ov::bfloat16> A_(BM, BK + 32, true);
+    tensor2D<ov::bfloat16> A(BM, BK, &A_[0], A_.stride);
+    tensor2D<ov::bfloat16> B(BK, BN, true);
+    tensor2D<float> C0(BM, BN, true); // reference result
+    // tensor2D<float> C1(BM, BN, true); // reference result
+    tensor2D<float> C1_(BM, BN + 16*1, true); // actual result
+    tensor2D<float> C1(BM, BN, &C1_[0], C1_.stride); // actual result
+
+    Linear32x32_AMX_mkernel jit_amx(0, false);
+
+    auto Bt = B.Tr();
+    // auto B1 = repack_weights(Bt);
+    auto B1 = jit_amx.prepareB(&Bt[0], Bt.stride, BN, BK);
+
+    C0 = 0;
+    matmul(A, B, C0);
+
+    auto strideB = (BK / 32) * 2048;
+    TileConfigScope tcfg(jit_amx.m_tile_cfg);
+    {
+        jit_amx.run(BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
+                    B1,                                              //
+                    reinterpret_cast<uint8_t*>(&C1[0]), C1.stride,   //
+                    reinterpret_cast<uint8_t*>(&B1[0]));
+    }
+
+    std::string acc;
+    const char* acc_color = nullptr;
+    if (C0 == C1) {
+        acc = "[PASS]";
+    } else {
+        if (std::getenv("SHOW_ERR")) {
+            std::cout << "============= A ================ " << std::endl;
+            std::cout << A << std::endl;
+            std::cout << "============= B ================ " << std::endl;
+            std::cout << B << std::endl;
+            logger() << C0 << std::endl;
+            logger() << C1 << std::endl;
+        }
+        acc = "[FAIL]";
+        acc_color = "1;31";
+    }
+
+    perf_log plog({
+        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
+        {PERF_TYPE_RAW, 0x21a6, "BOUND_ON_LOADS"},
+    });
+    plog.reserve(512);
+    plog.tag("cache-COLD", BM, BK, BN, acc);
+    plog.color(acc_color);
+
+    int times = 1000;
+    for (int k = 0; k < 10; k++) {
+        plog(
+            [&]() {
+                for (int i = 0; i < times; i++)
+                jit_amx.run(BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
+                            B1,                                              //
+                            reinterpret_cast<uint8_t*>(&C1[0]), C1.stride,   //
+                            reinterpret_cast<uint8_t*>(&B1[0]));
+            },
+            times * 2.0 * BM * BN * BK // OPS per call per core
+        );
+    }
+
+    return;
+
+
+    std::vector<tensor2D<ov::bfloat16>> A1s;
+    tensor2D<ov::bfloat16> Abig(BM, num_AB_pairs * BK, true);
+    for (int i = 0; i < num_AB_pairs; i++) {
+        A1s.emplace_back(BM, BK, &Abig(0, i * BK), Abig.stride);
+        // A1s.emplace_back(A.clone());
+    }
+
+#pragma omp parallel
+    {
+        int ithr = omp_get_thread_num();
+
+        tensor2D<float> C2(BM, BN, true);
+        std::vector<tensor2D<ov::bfloat16>> B1s;
+        for (int i = 0; i < num_AB_pairs; i++) {
+            B1s.emplace_back(B1.clone());
+        }
+        Linear32x32_AMX_mkernel jit_amx0(BM, false);
+        Linear32x32_AMX_mkernel jit_amx1(BM, true);
+        TileConfigScope tcfg(jit_amx0.m_tile_cfg);
+
+#if 0
+#pragma omp barrier
+        {
+            // plog.tag("cache-HOT", M, K, N, acc);
+            // plog.color(acc_color);
+            for (int r = 0; r < 10; r++) {
+                tensor2D<ov::bfloat16>& blockB = B1s[0];
+                tensor2D<ov::bfloat16>& blockB1 = B1s[0];
+                plog(
+                    [&]() {
+                        jit_amx.run(reinterpret_cast<uint8_t*>(&A[0]), A.stride,     //
+                                    reinterpret_cast<uint8_t*>(&blockB[0]), strideB, //
+                                    reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,   //
+                                    reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    },
+                    2.0 * M * N * K // OPS per call per core
+                );
+            };
+        }
+#endif
+        clr_cache();
+        clr_cache();
+        clr_cache();
+
+#pragma omp barrier
+        plog(
+            [&]() {
+                Linear32x32_AMX_mkernel* pkernel = &jit_amx0;
+                for (int r = 0; r < num_AB_pairs; r++) {
+                    tensor2D<ov::bfloat16>& blockA = A1s[r];
+                    tensor2D<ov::bfloat16>& blockB = B1s[r];
+                    auto r1 = r + 1;
+                    tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
+
+                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,
+                                 reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    pkernel = &jit_amx1;
+                }
+            },
+            (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
+        );
+
+        if (ithr == 0)
+            plog(); // add separator
+
+#pragma omp barrier
+        plog(
+            [&]() {
+                Linear32x32_AMX_mkernel* pkernel = &jit_amx0;
+                for (int r = 0; r < num_AB_pairs; r++) {
+                    tensor2D<ov::bfloat16>& blockA = A1s[r];
+                    tensor2D<ov::bfloat16>& blockB = B1s[r];
+                    auto r1 = r + 1;
+                    tensor2D<ov::bfloat16>& blockB1 = B1s[r1 < B1s.size() ? r1 : r];
+
+                    pkernel->run(BM, reinterpret_cast<uint8_t*>(&blockA[0]), blockA.stride, blockB, reinterpret_cast<uint8_t*>(&C2[0]), C2.stride,
+                                 reinterpret_cast<uint8_t*>(&blockB1[0]));
+                    pkernel = &jit_amx1;
+                }
+            },
+            (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
+        );
+    }
+}
+
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    test(256, (int)BK, (int)BN, (int)NK);
+    test3(256, (int)BK, (int)BN, (int)NK);
     //test2(BM);
     return 0;
 }
