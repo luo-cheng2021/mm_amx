@@ -328,16 +328,27 @@ timeit timer({
     {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CYCLES"},
     //{PERF_TYPE_RAW, 0x3c, "CPU_CLK_UNHALTED.THREAD"},
     //{PERF_TYPE_RAW, 0x81d0, "MEM_LOAD_RETIRED.ALL_LOADS"},
-    {PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
-    {PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
+    //{PERF_TYPE_RAW, 0x82d0, "MEM_INST_RETIRED.ALL_STORES"},
+    {PERF_TYPE_RAW, 0x0144, "MEM_STORE_RETIRED.L2_HIT"},
+    {PERF_TYPE_RAW, 0xe224, "L2_RQSTS.ALL_RFO"},
+    //{PERF_TYPE_RAW, 0xc224, "L2_RQSTS.RFO_HIT"},
+    //{PERF_TYPE_RAW, 0x4023, "L2_TRANS.L2_WB"}
+    {PERF_TYPE_RAW, 0x1f25, "L2_LINES_IN.ALL"}
+    //{PERF_TYPE_HW_CACHE, 0x10002, "LLC_load_misses"},
+    //{PERF_TYPE_HW_CACHE, 0x2, "LLC_loads"},
     //{PERF_TYPE_RAW, 0x02b1, "UOPS_EXECUTED.CORE"},
 });
 
 template <typename LinearAMX>
 int amx_jit(const int M, const int N, const int K, int times = -1000) {
-    tensor2D<ov::bfloat16> A(M, K,
+    tensor2D<ov::bfloat16> A_(M, K + 32,
                              true); // ensure stride of A matrix is multiple of
+    tensor2D<ov::bfloat16> A(M, K,
+                             &A_[0], A_.stride); // ensure stride of A matrix is multiple of
                                     // cache line, which is vital to performance.
+    // tensor2D<ov::bfloat16> A(M, K,
+    //                          true); // ensure stride of A matrix is multiple of
+    //                                 // cache line, which is vital to performance.
     tensor2D<ov::bfloat16> B(K, N, true);
     auto Bt = B.Tr();
     tensor2D<ov::bfloat16> BPacked(K * N, 1, true);
@@ -431,7 +442,7 @@ int amx_mm(const int M, const int N, int K, int times = -1000) {
 
 class InstProfiler : public jit_generator {
 public:
-    InstProfiler() { create_kernel("InstProfiler"); }
+    InstProfiler(bool is_load = true) : _is_load(is_load) { create_kernel("InstProfiler"); }
     TileConfig m_tile_cfg;
     const TileConfig& tile_config() { return m_tile_cfg; }
 
@@ -441,6 +452,7 @@ public:
     Xbyak::Reg64 reg_addrB = abi_param4;
     Xbyak::Reg64 reg_cnt = abi_param5;
     Xbyak::Reg64 reg_strideB = r10;
+    bool _is_load;
 
     void generate() {
         m_tile_cfg.reset(1, 0,
@@ -458,43 +470,126 @@ public:
         mov(reg_strideB, 64);
         align(64, false);
         L(loop);
-        tileloadd(tmm0, ptr[reg_addrA + reg_strideA]);
-        lea(reg_addrA, ptr[reg_addrA + reg_stepA]);
-        tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
-        lea(reg_addrB, ptr[reg_addrB + 1024]);
+        if (_is_load) {
+            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-        tileloadd(tmm2, ptr[reg_addrA + reg_strideA]);
-        lea(reg_addrA, ptr[reg_addrA + reg_stepA]);
-        tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
-        lea(reg_addrB, ptr[reg_addrB + 1024]);
+            tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-        tileloadd(tmm4, ptr[reg_addrA + reg_strideA]);
-        lea(reg_addrA, ptr[reg_addrA + reg_stepA]);
-        tileloadd(tmm5, ptr[reg_addrB + reg_strideB]);
-        lea(reg_addrB, ptr[reg_addrB + 1024]);
+            tileloadd(tmm5, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-        tileloadd(tmm6, ptr[reg_addrA + reg_strideA]);
-        lea(reg_addrA, ptr[reg_addrA + reg_stepA]);
-        tileloadd(tmm7, ptr[reg_addrB + reg_strideB]);
-        lea(reg_addrB, ptr[reg_addrB + 1024]);
+            tileloadd(tmm7, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
+        } else {
+            tilestored(ptr[reg_addrB + reg_strideB], tmm1);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
+
+            tilestored(ptr[reg_addrB + reg_strideB], tmm3);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
+
+            tilestored(ptr[reg_addrB + reg_strideB], tmm5);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
+
+            tilestored(ptr[reg_addrB + reg_strideB], tmm7);
+            lea(reg_addrB, ptr[reg_addrB + 1024]);
+        }
 
         dec(reg_cnt);
         jnz(loop);
         ret();
     }
 };
-void profile_tileload() {
-    const int K = 32 * 8 * 20;
+
+void profile_tile() {
+    const int total = 512 * 1024;
+    const int N = 16;
+    const int K = total / sizeof(ov::bfloat16) / N;
     tensor2D<ov::bfloat16> A(16, K, true);
-    tensor2D<ov::bfloat16> B(K, 16, true);
-    InstProfiler p;
+    tensor2D<ov::bfloat16> B(K, N, true);
+    InstProfiler p(false);
     TileConfigScope tcfg(p.tile_config());
 
-    auto count = K / (32 * 8);
+    auto count = total / 4096;
+    memset(&B[0], 0, count * 4096);
+    timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+    std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tilestore)\n";
+    {
+        InstProfiler p(true);
+        timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+        std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tileload)\n";
+    }
+}
+
+class SetProfiler : public jit_generator {
+public:
+    SetProfiler(bool use_stream = false) : _use_stream(use_stream) { create_kernel("SetProfiler"); }
+
+    Xbyak::Reg64 reg_addrA = abi_param1;
+    Xbyak::Reg64 reg_strideA = abi_param2;
+    Xbyak::Reg64 reg_stepA = abi_param3;
+    Xbyak::Reg64 reg_addrB = abi_param4;
+    Xbyak::Reg64 reg_cnt = abi_param5;
+    Xbyak::Reg64 reg_strideB = r10;
+    bool _use_stream;
+
+    void generate() {
+        Xbyak::Label loop;
+        mov(reg_strideB, 64);
+        align(64, false);
+        L(loop);
+        if (!_use_stream) {
+            vmovdqa64(ptr[reg_addrB + 0], zmm1);
+            vmovdqa64(ptr[reg_addrB + 64], zmm2);
+            vmovdqa64(ptr[reg_addrB + 128], zmm3);
+            vmovdqa64(ptr[reg_addrB + 192], zmm4);
+        } else {
+            vmovntpd(ptr[reg_addrB + 0], zmm1);
+            vmovntpd(ptr[reg_addrB + 64], zmm2);
+            vmovntpd(ptr[reg_addrB + 128], zmm3);
+            vmovntpd(ptr[reg_addrB + 192], zmm4);
+        }
+        lea(reg_addrB, ptr[reg_addrB + 256]);
+
+        dec(reg_cnt);
+        jnz(loop);
+        ret();
+    }
+};
+
+void profile_set() {
+    const int total = 512 * 1024;
+    const int N = 16;
+    const int K = total / sizeof(ov::bfloat16) / N;
+
+    tensor2D<ov::bfloat16> A(K, N, true);
+    tensor2D<ov::bfloat16> B(K, N, true);
+    SetProfiler p;
+
+    auto count = total / 256;
+    memset(&A[0], 0, total);
     timer.tag(__func__, "A(K=", K, ")")(100, [&]() { p(&A[0], A.stride,  64, &B[0], count); });
     std::cout << "\t" << timer.perf_counters["HW_CYCLES"] / count / 8 << " cycles/tileLoad\n";
     timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
-    std::cout << "\t" << timer.perf_counters["HW_CYCLES"] / count / 8 << " cycles/tileLoad\n";
+    std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(vmovdqa64)\n";
+    {
+        SetProfiler p(true);
+        timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+        std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(vmovntpd)\n";        
+    }
+    timer.tag(__func__, "Bm(K=", K, ")")(100, [&]() { 
+        auto p = (float*)&B[0];
+        for (size_t i = 0; i < total / 4; i += 16)
+            _mm512_store_ps(p + i, _mm512_set1_ps(1.0f));
+    });
+    std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(instrinsic)\n";
+    timer.tag(__func__, "A(K=", K, ")")(100, [&]() { memcpy(&B[0], &A[0], total); });
+    std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(memcpy)\n";
+    timer.tag(__func__, "Bm(K=", K, ")")(100, [&]() { 
+        memset(&B[0], 2, total);
+    });
+    std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(memset)\n";
 }
 
 int main(int argc, const char* argv[]) {
@@ -506,10 +601,15 @@ int main(int argc, const char* argv[]) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
-    // std::cout << "===============================Strided load is slightly slower========================\n";
-    // profile_tileload();
-    // profile_tileload();
-    // profile_tileload();
+    std::cout << "===============================set load is slightly slower========================\n";
+    profile_set();
+    profile_set();
+    profile_set();
+
+    std::cout << "===============================Strided load is slightly slower========================\n";
+    profile_tile();
+    profile_tile();
+    profile_tile();
     // std::cout << "===============================BF16========================\n";
     // amx_mm(32, 32, 128);
     // amx_jit<Linear32x32_AMX>(32, 32, 128);
@@ -520,6 +620,8 @@ int main(int argc, const char* argv[]) {
     for (int i = 0; i < 2; i++) {
         amx_mm(32, 1024, 64);
         amx_jit<Linear32x32_AMX>(32, 1024, 64);
+        amx_jit<Linear32x32_AMX>(32, 64, 4096);
+        amx_jit<Linear32x32_AMX>(32, 128, 1024);
     }
     // std::cout << "===============================32x32 (LLC)========================\n";
     // for (int i = 0; i < 2; i++) {
