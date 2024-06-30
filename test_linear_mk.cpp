@@ -440,17 +440,14 @@ int amx_mm(const int M, const int N, int K, int times = -1000) {
     return 0;
 }
 
-class InstProfiler : public jit_generator {
+class TileLoadStoreProfiler : public jit_generator {
 public:
-    InstProfiler(bool is_load = true) : _is_load(is_load) { create_kernel("InstProfiler"); }
+    TileLoadStoreProfiler(bool is_load = true) : _is_load(is_load) { create_kernel("TileLoadStoreProfiler"); }
     TileConfig m_tile_cfg;
     const TileConfig& tile_config() { return m_tile_cfg; }
 
-    Xbyak::Reg64 reg_addrA = abi_param1;
-    Xbyak::Reg64 reg_strideA = abi_param2;
-    Xbyak::Reg64 reg_stepA = abi_param3;
-    Xbyak::Reg64 reg_addrB = abi_param4;
-    Xbyak::Reg64 reg_cnt = abi_param5;
+    Xbyak::Reg64 reg_addrB = abi_param1;
+    Xbyak::Reg64 reg_cnt = abi_param2;
     Xbyak::Reg64 reg_strideB = r10;
     bool _is_load;
 
@@ -474,25 +471,25 @@ public:
             tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
+            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tileloadd(tmm5, ptr[reg_addrB + reg_strideB]);
+            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tileloadd(tmm7, ptr[reg_addrB + reg_strideB]);
+            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
         } else {
             tilestored(ptr[reg_addrB + reg_strideB], tmm1);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tilestored(ptr[reg_addrB + reg_strideB], tmm3);
+            tilestored(ptr[reg_addrB + reg_strideB], tmm1);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tilestored(ptr[reg_addrB + reg_strideB], tmm5);
+            tilestored(ptr[reg_addrB + reg_strideB], tmm1);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tilestored(ptr[reg_addrB + reg_strideB], tmm7);
+            tilestored(ptr[reg_addrB + reg_strideB], tmm1);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
         }
 
@@ -502,35 +499,115 @@ public:
     }
 };
 
-void profile_tile() {
-    const int total = 512 * 1024;
+class TileStrideLoadStoreProfiler : public jit_generator {
+public:
+    TileStrideLoadStoreProfiler(bool is_load = true) : _is_load(is_load) { create_kernel("TileStrideLoadStoreProfiler"); }
+    TileConfig m_tile_cfg;
+    const TileConfig& tile_config() { return m_tile_cfg; }
+
+    Xbyak::Reg64 reg_addrB = abi_param1;
+    Xbyak::Reg64 reg_strideB = abi_param2;
+    Xbyak::Reg64 reg_cnt = abi_param3;
+    bool _is_load;
+
+    void generate() {
+        m_tile_cfg.reset(1, 0,
+                         {
+                             {16, 64}, // C:0
+                             {16, 64}, // C:1
+                             {16, 64}, // C:2
+                             {16, 64}, // C:3
+                             {16, 64}, // A0:4
+                             {16, 64}, // A1:5
+                             {16, 64}, // B0:6
+                             {16, 64}, // B1:7
+                         });
+        Xbyak::Label loop;
+        align(64);
+        L(loop);
+        if (_is_load) {
+            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+
+            tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+
+            tileloadd(tmm5, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+
+            tileloadd(tmm7, ptr[reg_addrB + reg_strideB]);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+        } else {
+            tilestored(ptr[reg_addrB + reg_strideB], tmm1);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+
+            tilestored(ptr[reg_addrB + reg_strideB], tmm3);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+
+            tilestored(ptr[reg_addrB + reg_strideB], tmm5);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+
+            tilestored(ptr[reg_addrB + reg_strideB], tmm7);
+            lea(reg_addrB, ptr[reg_addrB + 64]);
+        }
+
+        dec(reg_cnt);
+        jnz(loop);
+        ret();
+    }
+};
+
+void profile_tile_loadstore(int total) {
     const int N = 16;
     const int K = total / sizeof(ov::bfloat16) / N;
-    tensor2D<ov::bfloat16> A(16, K, true);
     tensor2D<ov::bfloat16> B(K, N, true);
-    InstProfiler p(false);
+    TileLoadStoreProfiler p(false);
     TileConfigScope tcfg(p.tile_config());
 
     auto count = total / 4096;
-    memset(&B[0], 0, count * 4096);
-    timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+    memset(&B[0], 0, total);
+    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count); });
     std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tilestore)\n";
     {
-        InstProfiler p(true);
-        timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+        TileLoadStoreProfiler p(true);
+        timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count); });
         std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tileload)\n";
     }
+}
+
+void profile_tile_strideloadstore(int M, int N) {
+    int total = M * N * sizeof(float);
+    tensor2D<float> B(M, N, true);
+    TileStrideLoadStoreProfiler p_store(false);
+    TileStrideLoadStoreProfiler p_load(true);
+    TileConfigScope tcfg(p_store.tile_config());
+
+    memset(&B[0], 0, total);
+    auto test = [&] (const tensor2D<float>& t) {
+        timer.tag(__func__, "B(Stride=", t.stride, ")")(100, [&]() { 
+        for(int i = 0; i < M; i += 16)
+            p_store(&t(i, 0), t.stride, N / 16 / 4); 
+        });
+        std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tilestore)\n";
+        timer.tag(__func__, "B(Stride=", t.stride, ")")(100, [&]() { 
+        for(int i = 0; i < M; i += 16)
+            p_load(&t(i, 0), t.stride, N / 16 / 4);
+        });
+        std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tileload)\n";
+    };
+    test(B);
+    tensor2D<float> B_(M, N+16, true);
+    memset(&B_[0], 0, M*(N+16)*4);
+    tensor2D<float> B1(M, N, &B_[0], B_.stride);
+    test(B1);
 }
 
 class SetProfiler : public jit_generator {
 public:
     SetProfiler(bool use_stream = false) : _use_stream(use_stream) { create_kernel("SetProfiler"); }
 
-    Xbyak::Reg64 reg_addrA = abi_param1;
-    Xbyak::Reg64 reg_strideA = abi_param2;
-    Xbyak::Reg64 reg_stepA = abi_param3;
-    Xbyak::Reg64 reg_addrB = abi_param4;
-    Xbyak::Reg64 reg_cnt = abi_param5;
+    Xbyak::Reg64 reg_addrB = abi_param1;
+    Xbyak::Reg64 reg_cnt = abi_param2;
     Xbyak::Reg64 reg_strideB = r10;
     bool _use_stream;
 
@@ -558,8 +635,7 @@ public:
     }
 };
 
-void profile_set() {
-    const int total = 512 * 1024;
+void profile_set(int total) {
     const int N = 16;
     const int K = total / sizeof(ov::bfloat16) / N;
 
@@ -568,25 +644,24 @@ void profile_set() {
     SetProfiler p;
 
     auto count = total / 256;
+    memset(&B[0], 0, total);
     memset(&A[0], 0, total);
-    timer.tag(__func__, "A(K=", K, ")")(100, [&]() { p(&A[0], A.stride,  64, &B[0], count); });
-    std::cout << "\t" << timer.perf_counters["HW_CYCLES"] / count / 8 << " cycles/tileLoad\n";
-    timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count); });
     std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(vmovdqa64)\n";
     {
         SetProfiler p(true);
-        timer.tag(__func__, "B(K=", K, ")")(100, [&]() { p(&A[0], 64, 1024, &B[0], count); });
+        timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count); });
         std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(vmovntpd)\n";        
     }
-    timer.tag(__func__, "Bm(K=", K, ")")(100, [&]() { 
+    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { 
         auto p = (float*)&B[0];
         for (size_t i = 0; i < total / 4; i += 16)
             _mm512_store_ps(p + i, _mm512_set1_ps(1.0f));
     });
     std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(instrinsic)\n";
-    timer.tag(__func__, "A(K=", K, ")")(100, [&]() { memcpy(&B[0], &A[0], total); });
+    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { memcpy(&B[0], &A[0], total); });
     std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(memcpy)\n";
-    timer.tag(__func__, "Bm(K=", K, ")")(100, [&]() { 
+    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { 
         memset(&B[0], 2, total);
     });
     std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(memset)\n";
@@ -602,14 +677,21 @@ int main(int argc, const char* argv[]) {
     std::cout << ANSIcolor("31") << "omp_get_num_threads() = " << omp_get_num_threads() << std::endl << ANSIcolor();
 
     std::cout << "===============================set load is slightly slower========================\n";
-    profile_set();
-    profile_set();
-    profile_set();
+    profile_set(512 * 1024);
+    profile_set(512 * 1024);
+    profile_set(512 * 1024 * 100);
+    profile_set(512 * 1024 * 100);
 
-    std::cout << "===============================Strided load is slightly slower========================\n";
-    profile_tile();
-    profile_tile();
-    profile_tile();
+    std::cout << "===============================load store========================\n";
+    profile_tile_loadstore(512 * 1024);
+    profile_tile_loadstore(512 * 1024);
+    profile_tile_loadstore(512 * 1024 * 100);
+    profile_tile_loadstore(512 * 1024 * 100);
+
+    std::cout << "===============================strided load store========================\n";
+    profile_tile_strideloadstore(256, 256);
+    profile_tile_strideloadstore(256, 256);
+    profile_tile_strideloadstore(256, 256);
     // std::cout << "===============================BF16========================\n";
     // amx_mm(32, 32, 128);
     // amx_jit<Linear32x32_AMX>(32, 32, 128);
@@ -622,6 +704,7 @@ int main(int argc, const char* argv[]) {
         amx_jit<Linear32x32_AMX>(32, 1024, 64);
         amx_jit<Linear32x32_AMX>(32, 64, 4096);
         amx_jit<Linear32x32_AMX>(32, 128, 1024);
+        amx_jit<Linear32x32_AMX>(32, 64, 1024);
     }
     // std::cout << "===============================32x32 (LLC)========================\n";
     // for (int i = 0; i < 2; i++) {

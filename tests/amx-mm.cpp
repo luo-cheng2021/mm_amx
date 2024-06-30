@@ -243,11 +243,14 @@ public:
 
         align(64);
         L(loop_over_ktiles);
+
         // for (int k = 0; k < Ktiles; k++) {
         tileloadd(tmmA0, ptr[reg_A_addr + reg_A_stride]);
+        //tileloadd(tmmC11, ptr[reg_A_addr + reg_A_stride]);
         tileloadd(tmmB0, ptr[reg_B_addr + reg_B_stride]);
         lea(reg_B_addr, ptr[reg_B_addr + 1024]);
 
+        //tdpbf16ps(tmmC00, tmmA0, tmmB0);
         tdpbf16ps(tmmC00, tmmA0, tmmB0);
         if (cur_PFB < num_PFB) {
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
@@ -258,7 +261,9 @@ public:
             prefetcht2(ptr[reg_prefetch_A]);
 
         tileloadd(tmmA1, ptr[reg_A1_addr + reg_A_stride]);
+        //tileloadd(tmmC10, ptr[reg_A1_addr + reg_A_stride]);
         tdpbf16ps(tmmC10, tmmA1, tmmB0);
+        //tdpbf16ps(tmmC00, tmmA0, tmmA1);
         if (cur_PFB < num_PFB) {
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
             cur_PFB++;
@@ -271,6 +276,7 @@ public:
         // prefetch [num_Ktiles X 256] bytes
 
         tdpbf16ps(tmmC01, tmmA0, tmmB1);
+        //tdpbf16ps(tmmC00, tmmA0, tmmA1);
         if (cur_PFB < num_PFB) {
             prefetcht2(ptr[reg_prefetch + cur_PFB * 64]);
             cur_PFB++;
@@ -279,6 +285,7 @@ public:
             prefetcht2(ptr[reg_prefetch_A1]);
 
         tdpbf16ps(tmmC11, tmmA1, tmmB1);
+        //tdpbf16ps(tmmC00, tmmA0, tmmA1);
         // prefetch next sub-block B matrix
         if (cur_PFB < num_PFB) {
             for (int pi = cur_PFB; pi < num_PFB; pi++) {
@@ -952,7 +959,7 @@ void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    test3(256, (int)BK, (int)BN, (int)NK);
+    test3((int)BM, (int)BK, (int)BN, (int)NK);
     //test2(BM);
     return 0;
 }
