@@ -448,7 +448,7 @@ public:
 
     Xbyak::Reg64 reg_addrB = abi_param1;
     Xbyak::Reg64 reg_cnt = abi_param2;
-    Xbyak::Reg64 reg_strideB = r10;
+    Xbyak::Reg64 reg_strideB = abi_param3;
     bool _is_load;
 
     void generate() {
@@ -464,20 +464,19 @@ public:
                              {16, 64}, // B1:7
                          });
         Xbyak::Label loop;
-        mov(reg_strideB, 64);
-        align(64, false);
+        align(64);
         L(loop);
         if (_is_load) {
             tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
+            tileloadd(tmm2, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
+            tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
 
-            tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
+            tileloadd(tmm4, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 1024]);
         } else {
             tilestored(ptr[reg_addrB + reg_strideB], tmm1);
@@ -501,7 +500,7 @@ public:
 
 class TileStrideLoadStoreProfiler : public jit_generator {
 public:
-    TileStrideLoadStoreProfiler(bool is_load = true) : _is_load(is_load) { create_kernel("TileStrideLoadStoreProfiler"); }
+    TileStrideLoadStoreProfiler(bool is_load = true, bool unroll = false) : _is_load(is_load), _unroll(unroll) { create_kernel("TileStrideLoadStoreProfiler"); }
     TileConfig m_tile_cfg;
     const TileConfig& tile_config() { return m_tile_cfg; }
 
@@ -509,6 +508,7 @@ public:
     Xbyak::Reg64 reg_strideB = abi_param2;
     Xbyak::Reg64 reg_cnt = abi_param3;
     bool _is_load;
+    bool _unroll;
 
     void generate() {
         m_tile_cfg.reset(1, 0,
@@ -523,32 +523,44 @@ public:
                              {16, 64}, // B1:7
                          });
         Xbyak::Label loop;
+        Xbyak::Reg64 reg_addrBNext = r10;
+        mov(r10, reg_addrB);
+        lea(reg_addrBNext, ptr[reg_addrBNext + 8 * reg_strideB]);
+        lea(reg_addrBNext, ptr[reg_addrBNext + 8 * reg_strideB]);
         align(64);
         L(loop);
         if (_is_load) {
             tileloadd(tmm1, ptr[reg_addrB + reg_strideB]);
             lea(reg_addrB, ptr[reg_addrB + 64]);
 
-            tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
-            lea(reg_addrB, ptr[reg_addrB + 64]);
+            if (_unroll) {
+                tileloadd(tmm2, ptr[reg_addrBNext + reg_strideB]);
+                lea(reg_addrBNext, ptr[reg_addrBNext + 64]);
+            }
+            // tileloadd(tmm3, ptr[reg_addrB + reg_strideB]);
+            // lea(reg_addrB, ptr[reg_addrB + 64]);
 
-            tileloadd(tmm5, ptr[reg_addrB + reg_strideB]);
-            lea(reg_addrB, ptr[reg_addrB + 64]);
+            // tileloadd(tmm5, ptr[reg_addrB + reg_strideB]);
+            // lea(reg_addrB, ptr[reg_addrB + 64]);
 
-            tileloadd(tmm7, ptr[reg_addrB + reg_strideB]);
-            lea(reg_addrB, ptr[reg_addrB + 64]);
+            // tileloadd(tmm7, ptr[reg_addrB + reg_strideB]);
+            // lea(reg_addrB, ptr[reg_addrB + 64]);
         } else {
             tilestored(ptr[reg_addrB + reg_strideB], tmm1);
             lea(reg_addrB, ptr[reg_addrB + 64]);
 
-            tilestored(ptr[reg_addrB + reg_strideB], tmm3);
-            lea(reg_addrB, ptr[reg_addrB + 64]);
+            if (_unroll) {
+                tilestored(ptr[reg_addrBNext + reg_strideB], tmm2);
+                lea(reg_addrBNext, ptr[reg_addrBNext + 64]);
+            }
+            // tilestored(ptr[reg_addrB + reg_strideB], tmm3);
+            // lea(reg_addrB, ptr[reg_addrB + 64]);
 
-            tilestored(ptr[reg_addrB + reg_strideB], tmm5);
-            lea(reg_addrB, ptr[reg_addrB + 64]);
+            // tilestored(ptr[reg_addrB + reg_strideB], tmm5);
+            // lea(reg_addrB, ptr[reg_addrB + 64]);
 
-            tilestored(ptr[reg_addrB + reg_strideB], tmm7);
-            lea(reg_addrB, ptr[reg_addrB + 64]);
+            // tilestored(ptr[reg_addrB + reg_strideB], tmm7);
+            // lea(reg_addrB, ptr[reg_addrB + 64]);
         }
 
         dec(reg_cnt);
@@ -566,34 +578,34 @@ void profile_tile_loadstore(int total) {
 
     auto count = total / 4096;
     memset(&B[0], 0, total);
-    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count); });
+    timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count, 64); });
     std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tilestore)\n";
     {
         TileLoadStoreProfiler p(true);
-        timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count); });
+        timer.tag(__func__, "(total=", total/1024, "KB)")(100, [&]() { p(&B[0], count, 64); });
         std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tileload)\n";
     }
 }
 
-void profile_tile_strideloadstore(int M, int N) {
+void profile_tile_strideloadstore(int M, int N, bool unroll) {
     int total = M * N * sizeof(float);
     tensor2D<float> B(M, N, true);
-    TileStrideLoadStoreProfiler p_store(false);
-    TileStrideLoadStoreProfiler p_load(true);
+    TileStrideLoadStoreProfiler p_store(false, unroll);
+    TileStrideLoadStoreProfiler p_load(true, unroll);
     TileConfigScope tcfg(p_store.tile_config());
 
     memset(&B[0], 0, total);
     auto test = [&] (const tensor2D<float>& t) {
-        timer.tag(__func__, "B(Stride=", t.stride, ")")(100, [&]() { 
-        for(int i = 0; i < M; i += 16)
-            p_store(&t(i, 0), t.stride, N / 16 / 4); 
-        });
-        std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tilestore)\n";
-        timer.tag(__func__, "B(Stride=", t.stride, ")")(100, [&]() { 
-        for(int i = 0; i < M; i += 16)
-            p_load(&t(i, 0), t.stride, N / 16 / 4);
+        timer.tag(__func__, "B(Stride=", t.stride, unroll ? "unroll" : "", ")")(100, [&]() {
+        for(int i = 0; i < M; i += unroll ? 32 : 16)
+            p_load(&t(i, 0), t.stride, N / 16);
         });
         std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tileload)\n";
+        timer.tag(__func__, "B(Stride=", t.stride, unroll ? "unroll" : "", ")")(100, [&]() {
+        for(int i = 0; i < M; i += unroll ? 32 : 16)
+            p_store(&t(i, 0), t.stride, N / 16); 
+        });
+        std::cout << "\t" << std::fixed << std::setprecision(2) << (double)total / timer.perf_counters["HW_CYCLES"] << " bytes/cycle(tilestore)\n";
     };
     test(B);
     tensor2D<float> B_(M, N+16, true);
@@ -689,9 +701,11 @@ int main(int argc, const char* argv[]) {
     profile_tile_loadstore(512 * 1024 * 100);
 
     std::cout << "===============================strided load store========================\n";
-    profile_tile_strideloadstore(256, 256);
-    profile_tile_strideloadstore(256, 256);
-    profile_tile_strideloadstore(256, 256);
+    profile_tile_strideloadstore(256, 256, false);
+    profile_tile_strideloadstore(256, 256, false);
+    std::cout << "===============================LLC strided load store========================\n";
+    profile_tile_strideloadstore(2048, 512, true);
+    profile_tile_strideloadstore(2048, 512, true);
     // std::cout << "===============================BF16========================\n";
     // amx_mm(32, 32, 128);
     // amx_jit<Linear32x32_AMX>(32, 32, 128);
