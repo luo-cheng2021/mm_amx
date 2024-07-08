@@ -800,8 +800,51 @@ EnvVar BM("BM", 256);
 EnvVar BN("BN", 256);
 EnvVar BK("BK", 256);
 EnvVar NK("NK", 16);
+EnvVar KS("KS", 0);
 
-void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
+void run(Linear32x32_AMX_mkernel& jit_zero, Linear32x32_AMX_mkernel& jit_add, int M,
+         uint8_t* pA, int strideA,           // A [M, K]
+         tensor2D<ov::bfloat16>& repacked_B, // B [N/32, K*32]
+         uint8_t* pC, int strideC,           // C [M, N]
+         uint8_t* prefetch_B,                // prefetch B
+         int K_sub = 0
+) {
+    // number of blocks in N dimension (in unit of 32 columns)
+    auto num_blkN = repacked_B.dims[0];
+    auto K = repacked_B.dims[1] / 32;
+    if (K_sub == 0) {
+        K_sub = K;
+    }
+    auto* pB = reinterpret_cast<uint8_t*>(&repacked_B[0]);
+    auto strideB = repacked_B.stride;
+    jit_zero.m_ktiles = K_sub / 32;
+    jit_add.m_ktiles = K_sub / 32;
+
+    assert((K_sub % 32) == 0);
+
+    Linear32x32_AMX_mkernel* jit = &jit_zero;
+    for (int k = 0; k < K; k += K_sub) {
+
+        pB += k * 32 * sizeof(ov::bfloat16);
+        auto* pA1 = pA + k * sizeof(ov::bfloat16);
+        auto* pC1 = pC;
+
+        // if (BM != m_BM_hint) it only effect prefetch of B which is not vital to function
+        for (int m = 0; m < M; m += 32, pA1 += 32 * strideA, pC1 += 32 * strideC) {
+            auto* pB1 = pB;
+            // prefetch_next_A_addr = pA + 32 * strideA;
+            // if (m + 32 >= BM)
+            //     prefetch_next_A_addr = pA;
+            for (int ni = 0; ni < num_blkN; ni++, pB1 += strideB) {
+                (*jit)(pA1, strideA, pB1, pC1 + ni * 32 * sizeof(float), strideC, 0);
+                // prefetch_next_A_addr += 4 * strideA;
+            }
+        }
+        jit = &jit_add;
+    }
+}
+
+void test3(int BM, int BK, int BN, const int num_AB_pairs, int KS) {
     // tensor2D<ov::bfloat16> A(BM, BK, true);
     tensor2D<ov::bfloat16> A_(BM, BK + 32, true);
     tensor2D<ov::bfloat16> A(BM, BK, &A_[0], A_.stride);
@@ -812,6 +855,7 @@ void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
     tensor2D<float> C1(BM, BN, &C1_[0], C1_.stride); // actual result
 
     Linear32x32_AMX_mkernel jit_amx(0, false);
+    Linear32x32_AMX_mkernel jit_amx1(0, true);
 
     auto Bt = B.Tr();
     // auto B1 = repack_weights(Bt);
@@ -823,10 +867,12 @@ void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
     auto strideB = (BK / 32) * 2048;
     TileConfigScope tcfg(jit_amx.m_tile_cfg);
     {
-        jit_amx.run(BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
+        run(jit_amx, jit_amx1,
+            BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
                     B1,                                              //
                     reinterpret_cast<uint8_t*>(&C1[0]), C1.stride,   //
-                    reinterpret_cast<uint8_t*>(&B1[0]));
+                    reinterpret_cast<uint8_t*>(&B1[0]),
+                    KS);
     }
 
     std::string acc;
@@ -859,17 +905,19 @@ void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
         plog(
             [&]() {
                 for (int i = 0; i < times; i++)
-                jit_amx.run(BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
+                run(jit_amx, jit_amx1,
+                    BM, reinterpret_cast<uint8_t*>(&A[0]), A.stride, //
                             B1,                                              //
                             reinterpret_cast<uint8_t*>(&C1[0]), C1.stride,   //
-                            reinterpret_cast<uint8_t*>(&B1[0]));
+                            reinterpret_cast<uint8_t*>(&B1[0]),
+                            KS);
             },
             times * 2.0 * BM * BN * BK // OPS per call per core
         );
     }
 
     return;
-
+#if 0
 
     std::vector<tensor2D<ov::bfloat16>> A1s;
     tensor2D<ov::bfloat16> Abig(BM, num_AB_pairs * BK, true);
@@ -954,12 +1002,13 @@ void test3(int BM, int BK, int BN, const int num_AB_pairs = 43) {
             (num_AB_pairs) * 2.0 * BM * BN * BK // OPS per call per core
         );
     }
+#endif
 }
 
 int main() {
     MSRConfig _msr;
     bool initAMX = initXTILE();
-    test3((int)BM, (int)BK, (int)BN, (int)NK);
+    test3((int)BM, (int)BK, (int)BN, (int)NK, (int)KS);
     //test2(BM);
     return 0;
 }
